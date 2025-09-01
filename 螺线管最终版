@@ -1,0 +1,905 @@
+import numpy as np
+from scipy.special import ellipk, ellipe
+import sys
+import time
+import matplotlib
+import csv
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+from matplotlib import cm
+matplotlib.rc("font", family="Microsoft YaHei")
+matplotlib.use('Qt5Agg')
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                             QGroupBox, QFormLayout, QTextEdit, QProgressBar,
+                             QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
+                             QFileDialog, QComboBox, QSizePolicy, QSplitter, QCheckBox)
+from PyQt5.QtCore import QThread, pyqtSignal
+
+# 真空磁导率 (H/m)
+mu0 = 4 * np.pi * 1e-7
+
+
+class FieldCalculationThread(QThread):
+    """用于后台计算磁场的线程"""
+    calculation_done = pyqtSignal(list)
+    calculation_progress = pyqtSignal(str, int, int)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, params, points):
+        super().__init__()
+        self.params = params
+        self.points = points
+
+    def run(self):
+        try:
+            results = []
+            total_points = len(self.points)
+
+            for i, (x_obs, z_obs) in enumerate(self.points):
+                # 更新进度
+                progress = int((i + 1) * 100 / total_points)
+                self.calculation_progress.emit(f"计算点 {i + 1}/{total_points}", i + 1, total_points)
+
+                # 计算单个点的磁场
+                start_time = time.time()
+                Br, Bz, B_total = self.calculate_field(self.params, x_obs, z_obs)
+                calc_time = time.time() - start_time
+
+                # 保存结果
+                results.append({
+                    'x': x_obs, 'z': z_obs,
+                    'Br': Br, 'Bz': Bz, 'B_total': B_total,
+                    'calc_time': calc_time
+                })
+
+            self.calculation_done.emit(results)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+    def compute_k2(self, r0, r, z0, z):
+        num = 4 * r0 * r
+        den = (r0 + r) ** 2 + (z - z0) ** 2
+        return num / den
+
+    def Bz_ring(self, i, r0, z0, r, z):
+        """单环电流在点(r, z)产生的 Bz 分量，文献公式(17)"""
+        k2 = self.compute_k2(r0, r, z0, z)
+        k2 = min(k2, 0.999999)
+        K = ellipk(k2)
+        E = ellipe(k2)
+        delta_z = z - z0
+        denom1 = np.sqrt((r + r0) ** 2 + delta_z ** 2)
+        denom2 = (r0 - r) ** 2 + delta_z ** 2
+        factor = mu0 * i / (2 * np.pi * denom1)
+        return factor * ((r0 ** 2 - r ** 2 - delta_z ** 2) / denom2 * E + K)
+
+    def Br_ring(self, i, r0, z0, r, z):
+        """单环电流在点(r, z)产生的 Br 分量，文献公式(16)"""
+        if r == 0:
+            return 0.0  # 在轴上无径向分量
+        k2 = self.compute_k2(r0, r, z0, z)
+        k2 = min(k2, 0.999999)
+        K = ellipk(k2)
+        E = ellipe(k2)
+        delta_z = z - z0
+        denom1 = np.sqrt((r + r0) ** 2 + delta_z ** 2)
+        denom2 = (r0 - r) ** 2 + delta_z ** 2
+        factor = mu0 * i * delta_z / (2 * np.pi * r * denom1)
+        return factor * ((r0 ** 2 + r ** 2 + delta_z ** 2) / denom2 * E - K)
+
+    def calculate_field(self, params, x_obs, z_obs):
+        """
+        计算多层多匝螺线管在 (x_obs, z_obs) 处的磁场分量，返回 (Br, Bz, B_total)
+        """
+        i = params['current']
+        N_layers = params['N_layers']
+        N_turns = params['N_turns']
+        r_inner = params['r_inner']
+        dr = params['dr']
+        dz = params['dz']
+
+        # 计算径向距离
+        r_obs = abs(x_obs)
+
+        Br_total = 0.0
+        Bz_total = 0.0
+
+        for j in range(N_layers):
+            r0 = r_inner + (j + 0.5) * dr
+            for i_turn in range(N_turns):
+                z0 = -(N_turns * dz) / 2 + (i_turn + 0.5) * dz
+                Br_total += self.Br_ring(i, r0, z0, r_obs, z_obs)
+                Bz_total += self.Bz_ring(i, r0, z0, r_obs, z_obs)
+
+        # 考虑x方向：当x为负时，Br分量方向相反
+        if x_obs < 0:
+            Br_total = -Br_total
+
+        B_total = np.sqrt(Br_total ** 2 + Bz_total ** 2)
+        return Br_total, Bz_total, B_total
+
+
+class PlotCanvas(FigureCanvas):
+    """自定义Matplotlib画布"""
+
+    def __init__(self, parent=None, width=10, height=8, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        super(PlotCanvas, self).__init__(self.fig)
+        self.setParent(parent)
+        self.fig.tight_layout()
+
+    def plot_axis_field(self, z_vals, b_vals, title="中轴线磁场分布"):
+        """绘制中轴线磁场分布图"""
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        # 绘制磁场分量
+        ax.plot(z_vals, b_vals['Bz'], 'b-', label='Python Bz (轴向分量)', linewidth=2)
+        ax.plot(z_vals, b_vals['Br'], 'r-', label='Python Br (径向分量)', linewidth=1)
+        ax.plot(z_vals, b_vals['B_total'], 'g-', label='Python |B| (总磁场)', linewidth=1)
+
+        # 设置坐标轴标签
+        ax.set_xlabel('Z位置 (m)')
+        ax.set_ylabel('磁场强度 (T)')
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True)
+
+        self.draw()
+
+    def plot_2d_contour(self, r_vals, z_vals, data_vals, title="磁场分布", colormap='viridis'):
+        """绘制二维磁场分布云图 (r-z平面)"""
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        # 设置插值网格
+        minR, maxR = min(r_vals), max(r_vals)
+        minZ, maxZ = min(z_vals), max(z_vals)
+
+        # 创建插值网格 - r 为横坐标，z 为纵坐标
+        ri = np.linspace(minR, maxR, 1000)
+        zi = np.linspace(minZ, maxZ, 1000)
+        Ri, Zi = np.meshgrid(ri, zi)
+
+        # 使用griddata进行插值
+        try:
+            # 尝试三次样条插值
+            Z = griddata((r_vals, z_vals), data_vals, (Ri, Zi), method='cubic')
+        except:
+            # 如果失败则使用线性插值
+            Z = griddata((r_vals, z_vals), data_vals, (Ri, Zi), method='linear')
+
+        # 方法1：使用pcolormesh生成连续颜色渐变（推荐）
+        img = ax.pcolormesh(Ri, Zi, Z, cmap=colormap, shading='auto')
+
+        # 方法2：使用imshow生成连续颜色渐变（需要调整坐标轴）
+        # img = ax.imshow(Z, cmap=colormap, extent=[minR, maxR, minZ, maxZ],
+        #                origin='lower', aspect='auto')
+
+        # 添加颜色条
+        cbar = self.fig.colorbar(img, ax=ax)
+        cbar.set_label('磁场强度 (T)', size=12)
+
+        # 设置坐标轴标签 - 横坐标为r，纵坐标为z
+        ax.set_xlabel('径向位置 r (m)')
+        ax.set_ylabel('轴向位置 z (m)')
+        ax.set_title(f'磁场分布: {title}')
+
+        # 添加等高线标记（可选）
+        contour = ax.contour(Ri, Zi, Z, 10, colors='black', linewidths=0.5)
+        ax.clabel(contour, inline=True, fontsize=8)
+
+        # 添加螺线管位置指示 - 改为水平线
+        if hasattr(self, 'solenoid_length'):
+            ax.axhline(y=-0.5 * self.solenoid_length, color='r', linestyle='--', alpha=0.7)
+            ax.axhline(y=0.5 * self.solenoid_length, color='r', linestyle='--', alpha=0.7)
+
+        # 设置坐标轴范围 - 横坐标为r，纵坐标为z
+        ax.set_xlim(minR, maxR)
+        ax.set_ylim(minZ, maxZ)
+
+        self.draw()
+    def set_solenoid_length(self, length):
+        """设置螺线管长度，用于绘图中的位置指示"""
+        self.solenoid_length = length
+
+    def clear_plot(self):
+        """清除当前图像"""
+        self.fig.clear()
+        self.draw()
+
+
+class SolenoidFieldApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("螺线管磁场计算与可视化")
+        self.setGeometry(100, 100, 1200, 800)
+
+        self.calc_thread = None
+        self.points = []  # 存储要计算的点
+        self.current_results = []  # 存储当前计算结果
+        self.comsol_data = None  # 存储COMSOL数据
+        self.comsol_z = None  # COMSOL z坐标
+        self.comsol_bz = None  # COMSOL Bz值
+
+        # 创建主部件和布局
+        main_widget = QWidget()
+        main_layout = QHBoxLayout()
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+        # 使用分割器创建左右两个区域
+        splitter = QSplitter()
+        main_layout.addWidget(splitter)
+
+        # 左侧控制面板
+        control_panel = QWidget()
+        control_layout = QVBoxLayout()
+        control_panel.setLayout(control_layout)
+
+        # 右侧绘图区域
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout()
+        plot_panel.setLayout(plot_layout)
+
+        splitter.addWidget(control_panel)
+        splitter.addWidget(plot_panel)
+        splitter.setSizes([400, 800])
+
+        # === 左侧控制面板 ===
+
+        # 输入参数组
+        input_group = QGroupBox("螺线管参数")
+        input_layout = QFormLayout()
+
+        self.current_input = QLineEdit("1.0")
+        self.N_layers_input = QLineEdit("8")
+        self.N_turns_input = QLineEdit("62")
+        self.r_inner_input = QLineEdit("0.0115")
+        self.dr_input = QLineEdit("0.0003")
+        self.dz_input = QLineEdit("0.0003")
+
+        input_layout.addRow("电流 I (A):", self.current_input)
+        input_layout.addRow("层数 N_layers:", self.N_layers_input)
+        input_layout.addRow("每层匝数 N_turns:", self.N_turns_input)
+        input_layout.addRow("内径 r_inner (m):", self.r_inner_input)
+        input_layout.addRow("径向间距 dr (m):", self.dr_input)
+        input_layout.addRow("轴向间距 dz (m):", self.dz_input)
+
+        input_group.setLayout(input_layout)
+        control_layout.addWidget(input_group)
+
+        # 点设置组
+        points_group = QGroupBox("计算点设置")
+        points_layout = QVBoxLayout()
+
+        # 单点设置
+        single_point_group = QGroupBox("单点计算")
+        single_point_layout = QFormLayout()
+
+        self.x_obs_input = QLineEdit("0.0")
+        self.z_obs_input = QLineEdit("0.0")
+
+        single_point_layout.addRow("径向位置 r (m):", self.x_obs_input)
+        single_point_layout.addRow("轴向位置 z (m):", self.z_obs_input)
+
+        self.add_point_button = QPushButton("添加点到列表")
+        self.add_point_button.clicked.connect(self.add_point)
+        single_point_layout.addRow(self.add_point_button)
+
+        single_point_group.setLayout(single_point_layout)
+        points_layout.addWidget(single_point_group)
+
+        # 中轴线点生成
+        axis_group = QGroupBox("中轴线计算点生成")
+        axis_layout = QFormLayout()
+
+        self.axis_z_min_input = QLineEdit("-0.1")
+        self.axis_z_max_input = QLineEdit("0.1")
+        self.axis_z_points_input = QLineEdit("100")
+
+        axis_layout.addRow("Z最小值 (m):", self.axis_z_min_input)
+        axis_layout.addRow("Z最大值 (m):", self.axis_z_max_input)
+        axis_layout.addRow("点数:", self.axis_z_points_input)
+
+        self.add_axis_button = QPushButton("生成中轴线计算点")
+        self.add_axis_button.clicked.connect(self.add_axis_points)
+        axis_layout.addRow(self.add_axis_button)
+
+        axis_group.setLayout(axis_layout)
+        points_layout.addWidget(axis_group)
+
+        # 二维网格点生成
+        grid_group = QGroupBox("二维网格点生成")
+        grid_layout = QFormLayout()
+
+        self.grid_r_min_input = QLineEdit("0.0")
+        self.grid_r_max_input = QLineEdit("0.02")
+        self.grid_r_points_input = QLineEdit("20")
+        self.grid_z_min_input = QLineEdit("-0.1")
+        self.grid_z_max_input = QLineEdit("0.1")
+        self.grid_z_points_input = QLineEdit("50")
+
+        grid_layout.addRow("径向最小值 (m):", self.grid_r_min_input)
+        grid_layout.addRow("径向最大值 (m):", self.grid_r_max_input)
+        grid_layout.addRow("径向点数:", self.grid_r_points_input)
+        grid_layout.addRow("轴向最小值 (m):", self.grid_z_min_input)
+        grid_layout.addRow("轴向最大值 (m):", self.grid_z_max_input)
+        grid_layout.addRow("轴向点数:", self.grid_z_points_input)
+
+        self.add_grid_button = QPushButton("生成二维网格点")
+        self.add_grid_button.clicked.connect(self.add_grid_points)
+        grid_layout.addRow(self.add_grid_button)
+
+        grid_group.setLayout(grid_layout)
+        points_layout.addWidget(grid_group)
+
+        # 点列表管理
+        points_manage_layout = QHBoxLayout()
+
+        self.clear_points_button = QPushButton("清空点列表")
+        self.clear_points_button.clicked.connect(self.clear_points)
+        points_manage_layout.addWidget(self.clear_points_button)
+
+        self.view_points_button = QPushButton("查看当前点列表")
+        self.view_points_button.clicked.connect(self.view_points)
+        points_manage_layout.addWidget(self.view_points_button)
+
+        points_layout.addLayout(points_manage_layout)
+
+        points_group.setLayout(points_layout)
+        control_layout.addWidget(points_group)
+
+        # 计算按钮
+        self.calc_button = QPushButton("计算磁场")
+        self.calc_button.clicked.connect(self.start_calculation)
+        control_layout.addWidget(self.calc_button)
+
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setVisible(False)
+        control_layout.addWidget(self.progress_bar)
+
+        # 进度标签
+        self.progress_label = QLabel()
+        self.progress_label.setVisible(False)
+        control_layout.addWidget(self.progress_label)
+
+        # 结果表格
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(6)
+        self.results_table.setHorizontalHeaderLabels([
+            "r (m)", "z (m)", "Br (T)", "Bz (T)", "|B| (T)", "时间 (s)"
+        ])
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.results_table.setVisible(False)
+        control_layout.addWidget(self.results_table)
+
+        # 添加示例按钮
+        example_button = QPushButton("加载示例参数")
+        example_button.clicked.connect(self.load_example)
+        control_layout.addWidget(example_button)
+
+        # 导出结果按钮
+        self.export_button = QPushButton("导出结果到CSV")
+        self.export_button.clicked.connect(self.export_results)
+        self.export_button.setEnabled(False)
+        control_layout.addWidget(self.export_button)
+
+        # === 右侧绘图区域 ===
+
+        # 绘图控制面板
+        plot_control_group = QGroupBox("绘图设置")
+        plot_control_layout = QHBoxLayout()
+
+        # 选择绘图类型
+        self.plot_type_combo = QComboBox()
+        self.plot_type_combo.addItems(["中轴线磁场分布", "二维磁场分布"])
+
+        # 选择磁场分量
+        self.field_component_combo = QComboBox()
+        self.field_component_combo.addItems(["总磁场 |B|", "轴向分量 Bz", "径向分量 Br"])
+
+        # 选择颜色映射
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems(["viridis", "plasma", "inferno", "magma", "cividis", "jet", "coolwarm"])
+
+        # 绘图按钮
+        self.plot_button = QPushButton("绘制磁场图")
+        self.plot_button.clicked.connect(self.plot_field)
+        self.plot_button.setEnabled(False)
+
+        # 添加清除图像按钮
+        self.clear_plot_button = QPushButton("清除图像")
+        self.clear_plot_button.clicked.connect(self.clear_plot)
+
+        # 添加导入COMSOL数据按钮
+        self.import_comsol_button = QPushButton("导入COMSOL数据")
+        self.import_comsol_button.clicked.connect(self.import_comsol_data)
+
+        plot_control_layout.addWidget(QLabel("绘图类型:"))
+        plot_control_layout.addWidget(self.plot_type_combo)
+        plot_control_layout.addWidget(QLabel("磁场分量:"))
+        plot_control_layout.addWidget(self.field_component_combo)
+        plot_control_layout.addWidget(QLabel("颜色映射:"))
+        plot_control_layout.addWidget(self.colormap_combo)
+        plot_control_layout.addWidget(self.plot_button)
+        plot_control_layout.addWidget(self.clear_plot_button)
+        plot_control_layout.addWidget(self.import_comsol_button)
+
+        plot_control_group.setLayout(plot_control_layout)
+        plot_layout.addWidget(plot_control_group)
+
+        # 创建绘图画布
+        self.plot_canvas = PlotCanvas(self, width=8, height=6, dpi=100)
+        plot_layout.addWidget(self.plot_canvas)
+
+        # 状态信息显示
+        self.status_text = QTextEdit()
+        self.status_text.setReadOnly(True)
+        plot_layout.addWidget(self.status_text)
+
+    def load_example(self):
+        """加载示例参数"""
+        self.current_input.setText("1.0")
+        self.N_layers_input.setText("8")
+        self.N_turns_input.setText("62")
+        self.r_inner_input.setText("0.0115")
+        self.dr_input.setText("0.0003")
+        self.dz_input.setText("0.0003")
+        self.x_obs_input.setText("0.0")
+        self.z_obs_input.setText("0.0")
+        self.axis_z_min_input.setText("-0.1")
+        self.axis_z_max_input.setText("0.1")
+        self.axis_z_points_input.setText("100")
+        self.grid_r_min_input.setText("0.0")
+        self.grid_r_max_input.setText("0.02")
+        self.grid_r_points_input.setText("20")
+        self.grid_z_min_input.setText("-0.1")
+        self.grid_z_max_input.setText("0.1")
+        self.grid_z_points_input.setText("50")
+
+        self.status_text.append("已加载示例参数")
+
+    def add_point(self):
+        """添加单个点到计算列表"""
+        try:
+            x_obs = float(self.x_obs_input.text())
+            z_obs = float(self.z_obs_input.text())
+            self.points.append((x_obs, z_obs))
+            self.status_text.append(f"已添加点: (r={x_obs:.4f}m, z={z_obs:.4f}m)")
+        except ValueError:
+            self.status_text.append("错误：请确保点坐标是有效的数字")
+
+    def add_axis_points(self):
+        """生成中轴线计算点"""
+        try:
+            # 清空现有点
+            self.points = []
+
+            # 获取参数
+            z_min = float(self.axis_z_min_input.text())
+            z_max = float(self.axis_z_max_input.text())
+            num_points = int(self.axis_z_points_input.text())
+
+            # 生成中轴线上的点 (r=0, z变化)
+            z_vals = np.linspace(z_min, z_max, num_points)
+
+            for z in z_vals:
+                self.points.append((0.0, z))
+
+            self.status_text.append(f"已在中轴线生成 {len(self.points)} 个计算点\n"
+                                    f"Z范围: {z_min}-{z_max}m")
+
+        except ValueError:
+            self.status_text.append("错误：请确保所有参数是有效的数字")
+
+    def add_grid_points(self):
+        """生成二维网格计算点"""
+        try:
+            # 清空现有点
+            self.points = []
+
+            # 获取参数
+            r_min = float(self.grid_r_min_input.text())
+            r_max = float(self.grid_r_max_input.text())
+            r_points = int(self.grid_r_points_input.text())
+            z_min = float(self.grid_z_min_input.text())
+            z_max = float(self.grid_z_max_input.text())
+            z_points = int(self.grid_z_points_input.text())
+
+            # 生成网格点
+            r_vals = np.linspace(r_min, r_max, r_points)
+            z_vals = np.linspace(z_min, z_max, z_points)
+
+            total_points = r_points * z_points
+            if total_points > 500:
+                reply = QMessageBox.question(self, "确认",
+                                             f"将生成 {total_points} 个点，计算可能耗时较长。继续吗？",
+                                             QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.No:
+                    return
+
+            for r in r_vals:
+                for z in z_vals:
+                    self.points.append((r, z))
+
+            self.status_text.append(f"已生成二维网格点: {len(self.points)} 个\n"
+                                    f"径向范围: {r_min}-{r_max}m, 点数: {r_points}\n"
+                                    f"轴向范围: {z_min}-{z_max}m, 点数: {z_points}")
+
+        except ValueError:
+            self.status_text.append("错误：请确保所有参数是有效的数字")
+
+    def clear_points(self):
+        """清空点列表"""
+        self.points = []
+        self.status_text.append("已清空点列表")
+
+    def view_points(self):
+        """查看当前点列表"""
+        if not self.points:
+            self.status_text.append("点列表为空")
+            return
+
+        message = "当前点列表:\n"
+        for i, (r, z) in enumerate(self.points):
+            message += f"{i + 1}. (r={r:.4f}m, z={z:.4f}m)\n"
+
+        self.status_text.append(message)
+
+    def get_params(self):
+        """获取螺线管参数"""
+        params = {
+            'current': float(self.current_input.text()),
+            'N_layers': int(self.N_layers_input.text()),
+            'N_turns': int(self.N_turns_input.text()),
+            'r_inner': float(self.r_inner_input.text()),
+            'dr': float(self.dr_input.text()),
+            'dz': float(self.dz_input.text())
+        }
+        return params
+
+    def start_calculation(self):
+        """开始磁场计算（在后台线程中）"""
+        if not self.points:
+            self.status_text.append("错误：请先添加计算点")
+            return
+
+        if self.calc_thread and self.calc_thread.isRunning():
+            self.status_text.append("警告：计算正在进行中，请等待完成")
+            return
+
+        try:
+            # 获取输入参数
+            params = self.get_params()
+
+            # 显示计算开始信息
+            self.status_text.append(f"\n开始计算 {len(self.points)} 个点的磁场...")
+            self.status_text.append(f"螺线管参数: 电流={params['current']}A, 层数={params['N_layers']}, "
+                                    f"每层匝数={params['N_turns']}, 内径={params['r_inner']}m")
+
+            # 禁用计算按钮，显示进度条
+            self.calc_button.setEnabled(False)
+            self.export_button.setEnabled(False)
+            self.plot_button.setEnabled(False)
+            self.progress_bar.setVisible(True)
+            self.progress_label.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("准备开始计算...")
+
+            # 创建计算线程
+            self.calc_thread = FieldCalculationThread(params, self.points)
+            self.calc_thread.calculation_done.connect(self.calculation_finished)
+            self.calc_thread.calculation_progress.connect(self.update_progress)
+            self.calc_thread.error_occurred.connect(self.calculation_error)
+            self.calc_thread.start()
+
+        except ValueError:
+            self.status_text.append("错误：请确保所有参数都是有效的数字")
+            self.calc_button.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            self.progress_label.setVisible(False)
+
+    def update_progress(self, message, current, total):
+        """更新进度信息"""
+        progress = int(current * 100 / total)
+        self.progress_bar.setValue(progress)
+        self.progress_label.setText(f"{message} - 进度: {progress}%")
+
+    def calculation_finished(self, results):
+        """计算完成后的处理"""
+        # 启用计算按钮，隐藏进度条
+        self.calc_button.setEnabled(True)
+        self.export_button.setEnabled(True)
+        self.plot_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+
+        # 保存结果
+        self.current_results = results
+
+        # 显示结果表格
+        self.results_table.setVisible(True)
+        self.results_table.setRowCount(len(results))
+
+        # 填充表格
+        for i, result in enumerate(results):
+            self.results_table.setItem(i, 0, QTableWidgetItem(f"{result['x']:.6e}"))
+            self.results_table.setItem(i, 1, QTableWidgetItem(f"{result['z']:.6e}"))
+            self.results_table.setItem(i, 2, QTableWidgetItem(f"{result['Br']:.6e}"))
+            self.results_table.setItem(i, 3, QTableWidgetItem(f"{result['Bz']:.6e}"))
+            self.results_table.setItem(i, 4, QTableWidgetItem(f"{result['B_total']:.6e}"))
+            self.results_table.setItem(i, 5, QTableWidgetItem(f"{result['calc_time']:.4f}"))
+
+        # 计算总时间
+        total_time = sum(r['calc_time'] for r in results)
+        self.status_text.append(f"\n计算完成！共计算 {len(results)} 个点，总耗时 {total_time:.2f} 秒")
+
+        # 尝试自动绘制结果
+        try:
+            self.plot_field()
+        except:
+            pass
+
+    def calculation_error(self, error_msg):
+        """计算出错时的处理"""
+        self.calc_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.status_text.append(f"\n计算错误: {error_msg}")
+
+    def export_results(self):
+        """将计算结果导出到CSV文件"""
+        if not self.current_results:
+            self.status_text.append("错误：没有计算结果可导出")
+            return
+
+        try:
+            # 弹出文件保存对话框
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存结果", "", "CSV Files (*.csv)"
+            )
+
+            if not file_path:
+                return
+
+            # 确保文件扩展名正确
+            if not file_path.lower().endswith('.csv'):
+                file_path += '.csv'
+
+            try:
+                # 尝试写入CSV文件
+                with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+
+                    # 写入表头
+                    headers = ["r (m)", "z (m)", "Br (T)", "Bz (T)", "|B| (T)", "计算时间 (s)"]
+                    writer.writerow(headers)
+
+                    # 写入数据
+                    for result in self.current_results:
+                        row = [
+                            result['x'], result['z'],
+                            result['Br'], result['Bz'], result['B_total'],
+                            result['calc_time']
+                        ]
+                        writer.writerow(row)
+
+                self.status_text.append(f"结果已成功导出到: {file_path}")
+            except PermissionError:
+                # 处理权限问题
+                self.status_text.append(f"导出失败：没有写入权限。请确保文件未被其他程序打开，并检查文件夹权限。")
+                self.status_text.append(f"尝试导出到其他位置：如桌面或文档文件夹。")
+            except Exception as e:
+                self.status_text.append(f"导出失败: {str(e)}")
+
+        except Exception as e:
+            self.status_text.append(f"导出失败: {str(e)}")
+
+    def import_comsol_data(self):
+        """导入COMSOL的中轴线磁场数据"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "导入COMSOL数据", "", "数据文件 (*.csv *.txt *.dat);;所有文件 (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # 读取文件
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+
+            # 解析数据 - 假设文件格式为：z坐标, Bz值
+            comsol_z = []
+            comsol_bz = []
+            for line in lines:
+                # 跳过注释行和空行
+                if line.startswith('#') or line.startswith('%') or line.startswith('//') or line.strip() == '':
+                    continue
+
+                # 尝试不同的分隔符：逗号、分号、制表符、空格
+                parts = None
+                if ',' in line:
+                    parts = line.split(',')
+                elif ';' in line:
+                    parts = line.split(';')
+                elif '\t' in line:
+                    parts = line.split('\t')
+                else:
+                    parts = line.split()
+
+                if len(parts) < 2:
+                    continue
+
+                try:
+                    z = float(parts[0].strip())
+                    bz = float(parts[1].strip())
+                    comsol_z.append(z)
+                    comsol_bz.append(bz)
+                except ValueError:
+                    continue
+
+            if not comsol_z:
+                self.status_text.append("导入失败：未找到有效数据")
+                return
+
+            # 按z坐标排序
+            sorted_indices = np.argsort(comsol_z)
+            self.comsol_z = np.array(comsol_z)[sorted_indices]
+            self.comsol_bz = np.array(comsol_bz)[sorted_indices]
+
+            self.status_text.append(f"成功导入 {len(self.comsol_z)} 个COMSOL数据点")
+            self.status_text.append(f"COMSOL数据范围: z={min(self.comsol_z):.4f}m 到 {max(self.comsol_z):.4f}m")
+
+            # 如果有计算结果，自动更新图表
+            if self.current_results:
+                self.plot_field()
+
+        except Exception as e:
+            self.status_text.append(f"导入COMSOL数据失败: {str(e)}")
+
+    def plot_field(self):
+        """绘制磁场分布图"""
+        if not self.current_results:
+            self.status_text.append("错误：没有计算结果可绘制")
+            return
+
+        # 获取绘图设置
+        plot_type = self.plot_type_combo.currentText()
+        field_component = self.field_component_combo.currentText()
+        colormap = self.colormap_combo.currentText()
+
+        # 提取坐标和磁场数据
+        r_vals = [r['x'] for r in self.current_results]
+        z_vals = [r['z'] for r in self.current_results]
+
+        # 根据选择的磁场分量获取数据
+        if field_component == "总磁场 |B|":
+            data_vals = [r['B_total'] for r in self.current_results]
+            title = "总磁场 |B| (T)"
+        elif field_component == "轴向分量 Bz":
+            data_vals = [r['Bz'] for r in self.current_results]
+            title = "轴向磁场 Bz (T)"
+        elif field_component == "径向分量 Br":
+            data_vals = [r['Br'] for r in self.current_results]
+            title = "径向磁场 Br (T)"
+
+        try:
+            if plot_type == "中轴线磁场分布":
+                # 检查是否中轴线数据 (所有r=0)
+                if not all(r == 0.0 for r in r_vals):
+                    self.status_text.append("警告：当前点集不是中轴线数据，仅绘制可用点")
+
+                # 提取中轴线数据
+                axis_points = [(r, z, d) for r, z, d in zip(r_vals, z_vals, data_vals) if r < 1e-6]
+                if not axis_points:
+                    self.status_text.append("错误：没有中轴线数据可绘制")
+                    return
+
+                # 排序并提取数据
+                axis_points.sort(key=lambda x: x[1])
+                z_axis = [p[1] for p in axis_points]
+                data_axis = [p[2] for p in axis_points]
+
+                # 绘制中轴线磁场图
+                self.plot_canvas.plot_axis_field(
+                    z_axis,
+                    {'Bz': data_axis, 'Br': [0] * len(z_axis), 'B_total': data_axis},
+                    "螺线管中轴线磁场分布"
+                )
+
+                # 添加COMSOL数据对比
+                if self.comsol_z is not None and self.comsol_bz is not None:
+                    # 获取当前的axes
+                    ax = self.plot_canvas.fig.axes[0]
+
+                    # 绘制COMSOL曲线
+                    ax.plot(self.comsol_z, self.comsol_bz, 'm--', label='COMSOL Bz', linewidth=2)
+
+                    # 重新绘制图例
+                    ax.legend()
+                    self.plot_canvas.draw()
+
+                # 计算并显示关键指标
+                max_bz = max(data_axis)
+                min_bz = min(data_axis)
+                uniformity = min_bz / max_bz * 100 if max_bz > 0 else 0
+
+                info = f"Python计算中轴线磁场分析:\n"
+                info += f"最大Bz: {max_bz:.6f} T\n"
+                info += f"最小Bz: {min_bz:.6f} T\n"
+                info += f"均匀性: {uniformity:.2f}%\n"
+
+                # 添加与COMSOL的对比分析
+                if self.comsol_z is not None and self.comsol_bz is not None:
+                    # 找到共同的z坐标范围
+                    z_min = max(min(z_axis), min(self.comsol_z))
+                    z_max = min(max(z_axis), max(self.comsol_z))
+
+                    if z_min >= z_max:
+                        self.status_text.append("警告：Python和COMSOL数据范围没有重叠，无法进行对比分析")
+                        return
+
+                    # 在共同范围内均匀采样点进行对比
+                    sample_z = np.linspace(z_min, z_max, 100)
+
+                    # 插值获取Python和COMSOL的值
+                    py_bz = np.interp(sample_z, z_axis, data_axis)
+                    comsol_bz = np.interp(sample_z, self.comsol_z, self.comsol_bz)
+
+                    # 计算差异
+                    abs_diff = np.abs(py_bz - comsol_bz)
+                    rel_diff = np.abs(py_bz - comsol_bz) / np.maximum(np.abs(comsol_bz), 1e-10) * 100
+
+                    max_abs_diff = np.max(abs_diff)
+                    max_rel_diff = np.max(rel_diff)
+                    avg_abs_diff = np.mean(abs_diff)
+                    avg_rel_diff = np.mean(rel_diff)
+
+                    # 计算相关系数
+                    correlation = np.corrcoef(py_bz, comsol_bz)[0, 1]
+
+                    # 计算均方根误差
+                    rmse = np.sqrt(np.mean((py_bz - comsol_bz) ** 2))
+
+                    info += f"\n与COMSOL对比分析 (在共同范围 z={z_min:.4f}m 到 {z_max:.4f}m):\n"
+                    info += f"最大绝对差异: {max_abs_diff:.6f} T\n"
+                    info += f"平均绝对差异: {avg_abs_diff:.6f} T\n"
+                    info += f"最大相对差异: {max_rel_diff:.2f}%\n"
+                    info += f"平均相对差异: {avg_rel_diff:.2f}%\n"
+                    info += f"相关系数: {correlation:.4f}\n"
+                    info += f"均方根误差 (RMSE): {rmse:.6f} T"
+
+                self.status_text.append(info)
+
+            else:  # 二维磁场分布
+                # 使用新的云图绘制方法
+                self.plot_canvas.plot_2d_contour(
+                    r_vals, z_vals, data_vals, title, colormap
+                )
+                # 设置螺线管长度用于绘图
+                params = self.get_params()
+                solenoid_length = params['N_turns'] * params['dz']
+                self.plot_canvas.set_solenoid_length(solenoid_length)
+
+        except Exception as e:
+            import traceback
+            self.status_text.append(f"绘图错误: {str(e)}\n{traceback.format_exc()}")
+
+    def clear_plot(self):
+        """清除当前绘制的图像"""
+        self.plot_canvas.clear_plot()
+        self.status_text.append("已清除当前图像")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = SolenoidFieldApp()
+    window.show()
+    sys.exit(app.exec_())
